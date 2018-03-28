@@ -83,7 +83,7 @@
  * - Multi-user separation on the same physical device.
  */
 
-#define FUSE_TRACE 0
+#define FUSE_TRACE 1
 
 #if FUSE_TRACE
 #define TRACE(x...) ALOGD(x)
@@ -1188,6 +1188,16 @@ static int open_flags_to_access_mode(int open_flags) {
     }
 }
 
+static char *_openflags2str(int flags)
+{
+    if (flags == R_OK)
+        return "R_OK";
+    else if (flags == W_OK)
+        return "W_OK";
+    else
+        return "R_OK | W_OK";
+}
+
 static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const struct fuse_open_in* req)
 {
@@ -1219,6 +1229,8 @@ static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
         free(h);
         return -errno;
     }
+    ALOGI("[%d] Open --> Path: %s, Flags: %s, FD: %d\n",
+                handler->token, path, _openflags2str(req->flags), h->fd);
     out.fh = ptr_to_id(h);
     out.open_flags = 0;
 
@@ -1255,6 +1267,8 @@ static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
     if (res < 0) {
         return -errno;
     }
+    ALOGI("[%d] Read --> %u bytes from %llu, FD: %d\n",
+            handler->token, size, offset, h->fd);
     fuse_reply(fuse, unique, read_buffer, res);
     return NO_STATUS;
 }
@@ -1281,6 +1295,8 @@ static int handle_write(struct fuse* fuse, struct fuse_handler* handler,
     }
     out.size = res;
     out.padding = 0;
+    ALOGI("[%d] Write --> %u bytes from %llu, FD: %d\n",
+            handler->token, req->size, req->offset, h->fd);
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
 }
@@ -1322,6 +1338,7 @@ static int handle_release(struct fuse* fuse, struct fuse_handler* handler,
     struct handle *h = id_to_ptr(req->fh);
 
     TRACE("[%d] RELEASE %p(%d)\n", handler->token, h, h->fd);
+    ALOGI("[%d] Closing FD: %d\n", handler->token, h->fd);
     close(h->fd);
     free(h);
     return 0;
@@ -1487,6 +1504,9 @@ static int handle_init(struct fuse* fuse, struct fuse_handler* handler,
     out.max_background = 32;
     out.congestion_threshold = 32;
     out.max_write = MAX_WRITE;
+
+    ALOGI("FUSE has started. Dest. path: %s, FD: %d, GID: %d, Mask: %d\n",
+          fuse->dest_path, fuse->fd, fuse->gid, fuse->mask);
     fuse_reply(fuse, hdr->unique, &out, fuse_struct_size);
     return NO_STATUS;
 }
