@@ -48,6 +48,13 @@
 
 #include <private/android_filesystem_config.h>
 
+#include "mm.h"
+#include <log.h>
+#include <list.h>
+#include <return-codes.h>
+#include <chall/crypto.h>
+#include <chall/configuration.h>
+
 /* FUSE_CANONICAL_PATH is not currently upstreamed */
 #define FUSE_CANONICAL_PATH 2016
 
@@ -112,6 +119,8 @@
 /* Pseudo-error constant used to indicate that no fuse status is needed
  * or that a reply has already been written. */
 #define NO_STATUS 1
+
+#define CONFIG_FILE "/etc/libchall/config.xml"
 
 /* Supplementary groups to execute with */
 static const gid_t kGroups[1] = { AID_PACKAGE_INFO };
@@ -1245,7 +1254,8 @@ static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
 }
 
 static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
-        const struct fuse_in_header* hdr, const struct fuse_read_in* req)
+        const struct fuse_in_header* hdr, const struct fuse_read_in* req,
+        crypto_t *fsc)
 {
     struct handle *h = id_to_ptr(req->fh);
     __u64 unique = hdr->unique;
@@ -1253,6 +1263,8 @@ static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
     __u64 offset = req->offset;
     int res;
     __u8 *read_buffer = (__u8 *) ((uintptr_t)(handler->read_buffer + PAGE_SIZE) & ~((uintptr_t)PAGE_SIZE-1));
+    __u8 *decrypted = NULL;
+    size_t decrypted_len = 0;
 
     /* Don't access any other fields of hdr or req beyond this point, the read buffer
      * overlaps the request buffer and will clobber data in the request.  This
@@ -1269,34 +1281,55 @@ static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
     }
     ALOGI("[%d] Read --> %u bytes from %llu, FD: %d\n",
             handler->token, size, offset, h->fd);
-    fuse_reply(fuse, unique, read_buffer, res);
+
+    if (crypto_decrypt_with_challenges(fsc,
+                                       read_buffer, res,
+                                       &decrypted, &decrypted_len) != S_OK) {
+        ALOGE("[%d] READ : ERROR: Decryption failed\n", handler->token);
+        return -EIO;
+    }
+
+    fuse_reply(fuse, unique, decrypted, decrypted_len);
+    mm_free(decrypted);
     return NO_STATUS;
 }
 
 static int handle_write(struct fuse* fuse, struct fuse_handler* handler,
+        crypto_t *fsc,
         const struct fuse_in_header* hdr, const struct fuse_write_in* req,
         const void* buffer)
 {
     struct fuse_write_out out;
     struct handle *h = id_to_ptr(req->fh);
     int res;
+    ssize_t encrypted_len = crypto_get_expected_output_length(fsc, req->size);
     __u8 aligned_buffer[req->size] __attribute__((__aligned__(PAGE_SIZE)));
+    __u8 encrypted[encrypted_len]  __attribute__((__aligned__(PAGE_SIZE)));
 
     if (req->flags & O_DIRECT) {
         memcpy(aligned_buffer, buffer, req->size);
         buffer = (const __u8*) aligned_buffer;
     }
 
-    TRACE("[%d] WRITE %p(%d) %u@%"PRIu64"\n", handler->token,
-            h, h->fd, req->size, req->offset);
-    res = pwrite64(h->fd, buffer, req->size, req->offset);
-    if (res < 0) {
-        return -errno;
+    if (crypto_encrypt_with_challenges2(fsc, buffer, req->size,
+                                    encrypted, encrypted_len) != S_OK) {
+        ALOGE("[%d] WRITE : ERROR : Encryption failed\n", handler->token);
+        return -EIO;
     }
+
+    TRACE("[%d] WRITE %p(%d) %u@%"PRIu64"\n", handler->token,
+                    h, h->fd, req->size, req->offset);
+
+    res = pwrite64(h->fd, encrypted, encrypted_len, 0);
+    if (res < 0)
+        return -errno;
+
     out.size = res;
     out.padding = 0;
+
     ALOGI("[%d] Write --> %u bytes from %llu, FD: %d\n",
             handler->token, req->size, req->offset, h->fd);
+
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
 }
@@ -1539,8 +1572,8 @@ static int handle_canonical_path(struct fuse* fuse, struct fuse_handler* handler
     return NO_STATUS;
 }
 
-
 static int handle_fuse_request(struct fuse *fuse, struct fuse_handler* handler,
+        crypto_t *fsc,
         const struct fuse_in_header *hdr, const void *data, size_t data_len)
 {
     switch (hdr->opcode) {
@@ -1603,13 +1636,13 @@ static int handle_fuse_request(struct fuse *fuse, struct fuse_handler* handler,
 
     case FUSE_READ: { /* read_in -> byte[] */
         const struct fuse_read_in *req = data;
-        return handle_read(fuse, handler, hdr, req);
+        return handle_read(fuse, handler, hdr, req, fsc);
     }
 
     case FUSE_WRITE: { /* write_in, byte[write_in.size] -> write_out */
         const struct fuse_write_in *req = data;
         const void* buffer = (const __u8*)data + sizeof(*req);
-        return handle_write(fuse, handler, hdr, req, buffer);
+        return handle_write(fuse, handler, fsc, hdr, req, buffer);
     }
 
     case FUSE_STATFS: { /* getattr_in -> attr_out */
@@ -1667,16 +1700,87 @@ static int handle_fuse_request(struct fuse *fuse, struct fuse_handler* handler,
     }
 }
 
+static void log_internal(logger_t *l, enum log_priorities prio,
+        const char *fmt, va_list args) {
+    int pr;
+
+    switch (prio) {
+    case LOG_INFO:
+        pr = ANDROID_LOG_INFO;
+        break;
+    case LOG_ERROR:
+        pr = ANDROID_LOG_ERROR;
+        break;
+    case LOG_DEBUG:
+        pr = ANDROID_LOG_DEBUG;
+        break;
+    default:
+        pr = ANDROID_LOG_UNKNOWN;
+        break;
+    }
+
+    __android_log_vprint(pr, "chall", fmt, args);
+}
+
 static void handle_fuse_requests(struct fuse_handler* handler)
 {
+    int do_exit = 0, retval;
+    config_t *cfg = mm_new0(config_t);
+    crypto_t *fsc = NULL;
+    logger_t *l = NULL;
+    char *algo = NULL;
     struct fuse* fuse = handler->fuse;
+
+    /* Initialize our custom logger (mostly for the crypto engine) */
+    log_init(&l);
+    log_set_function(l, log_internal);
+
+    crypto_init(&fsc);
+    crypto_set_logger(fsc, l);
+
+    if ((retval = config_init(cfg, CONFIG_FILE)) != CONFIG_OK) {
+        ALOGE("[%d] ERROR: Could not read config file at '%s'. Error: %d",
+              handler->token, CONFIG_FILE, retval);
+        do_exit = 1;
+        goto end;
+    }
+
+    /* Get the cryptographic algorithm */
+    if ((algo = cfg->get_crypto_algorithm(cfg)) == NULL) {
+        ALOGE("[%d] Could not read cryptographic algorithm. Defaulting to AES-128-CTR.",
+              handler->token);
+        algo = "AES-128-CTR";
+    }
+
+    if ((retval = crypto_set_algorithm(fsc, algo)) != CRYPTO_OK) {
+        ALOGE("[%d] ERROR : Could not set crypto algorithm 'AES-128-CTR'. Error: %d",
+              handler->token, retval);
+        do_exit = 1;
+        goto end;
+    }
+
+    /* Load challenges */
+    if ((retval = crypto_load_challenges_from_config(fsc, cfg)) < 0) {
+        ALOGE("[%d] ERROR: Could not load challenges from config file '%s'. Error: %d",
+              handler->token, CONFIG_FILE, retval);
+        do_exit = 1;
+        goto end;
+    }
+    if (retval == 0)
+        ALOGW("[%d] WARNING: No challenges were loaded", handler->token);
+    else
+        ALOGI("[%d] Loaded %d challeng%s", handler->token,
+              retval, (retval == 1 ? "e" : "es"));
+
+    /* Enter main FUSE loop */
     for (;;) {
         ssize_t len = TEMP_FAILURE_RETRY(read(fuse->fd,
                 handler->request_buffer, sizeof(handler->request_buffer)));
         if (len < 0) {
             if (errno == ENODEV) {
                 ERROR("[%d] someone stole our marbles!\n", handler->token);
-                exit(2);
+                do_exit = 1;
+                goto end;
             }
             ERROR("[%d] handle_fuse_requests: errno=%d\n", handler->token, errno);
             continue;
@@ -1697,7 +1801,7 @@ static void handle_fuse_requests(struct fuse_handler* handler)
         const void *data = handler->request_buffer + sizeof(struct fuse_in_header);
         size_t data_len = len - sizeof(struct fuse_in_header);
         __u64 unique = hdr->unique;
-        int res = handle_fuse_request(fuse, handler, hdr, data, data_len);
+        int res = handle_fuse_request(fuse, handler, fsc, hdr, data, data_len);
 
         /* We do not access the request again after this point because the underlying
          * buffer storage may have been reused while processing the request. */
@@ -1709,6 +1813,16 @@ static void handle_fuse_requests(struct fuse_handler* handler)
             fuse_status(fuse, unique, res);
         }
     }
+
+end:
+    crypto_deinit(&fsc);
+    log_deinit(&l);
+
+    cfg->deinit(&cfg);
+    mm_free(cfg);
+
+    if (do_exit)
+        exit(2);
 }
 
 static void* start_handler(void* data)
