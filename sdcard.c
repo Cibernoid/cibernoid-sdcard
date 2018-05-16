@@ -54,6 +54,7 @@
 #include <return-codes.h>
 #include <chall/crypto.h>
 #include <chall/configuration.h>
+#include <chall/formatter-xml.h>
 
 /* FUSE_CANONICAL_PATH is not currently upstreamed */
 #define FUSE_CANONICAL_PATH 2016
@@ -1262,6 +1263,7 @@ static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
     __u32 size = req->size;
     __u64 offset = req->offset;
     int res;
+    file_reader_t *r = NULL;
     __u8 *read_buffer = (__u8 *) ((uintptr_t)(handler->read_buffer + PAGE_SIZE) & ~((uintptr_t)PAGE_SIZE-1));
     __u8 *decrypted = NULL;
     size_t decrypted_len = 0;
@@ -1282,16 +1284,47 @@ static int handle_read(struct fuse* fuse, struct fuse_handler* handler,
     ALOGI("[%d] Read --> %u bytes from %llu, FD: %d\n",
             handler->token, size, offset, h->fd);
 
-    if (crypto_decrypt_with_challenges(fsc,
+    /* Initialize XML reader and decrypt content */
+    r = create_xml_reader();
+    if (!r) {
+        ALOGE("[%d] READ : ERROR : Could not create XML reader\n", handler->token);
+        goto error;
+    }
+
+    if (r->start_document(r, (const uint8_t *) read_buffer, res) != S_OK) {
+        ALOGE("[%d] READ : ERROR : start_document() failed\n", handler->token);
+        goto error;
+    }
+
+    decrypted_len = r->get_plaintext_length(r);
+    if (!decrypted_len) {
+        ALOGE("[%d] READ : ERROR : get_plaintext_length() returned zero\n", handler->token);
+        goto error;
+    }
+
+    decrypted = mm_malloc0(decrypted_len);
+
+    if (crypto_decrypt_with_challenges(fsc, r,
                                        read_buffer, res,
-                                       &decrypted, &decrypted_len) != S_OK) {
-        ALOGE("[%d] READ : ERROR: Decryption failed\n", handler->token);
-        return -EIO;
+                                       decrypted, decrypted_len) != S_OK) {
+        ALOGE("[%d] READ : ERROR : Could not decrypt ciphertext\n", handler->token);
+        goto error;
+    }
+
+    if (r->end_document(r) != S_OK) {
+        ALOGE("[%d] READ : ERROR : end_document() failed\n", handler->token);
+        goto error;
     }
 
     fuse_reply(fuse, unique, decrypted, decrypted_len);
+    destroy_xml_reader(r);
     mm_free(decrypted);
     return NO_STATUS;
+
+error:
+    destroy_xml_reader(r);
+    mm_free(decrypted);
+    return -EIO;
 }
 
 static int handle_write(struct fuse* fuse, struct fuse_handler* handler,
@@ -1302,25 +1335,50 @@ static int handle_write(struct fuse* fuse, struct fuse_handler* handler,
     struct fuse_write_out out;
     struct handle *h = id_to_ptr(req->fh);
     int res;
-    ssize_t encrypted_len = crypto_get_expected_output_length(fsc, req->size);
+    file_formatter_t *fmt = NULL;
+    __u8 *encrypted = NULL;
+    size_t encrypted_len = 0;
+    //ssize_t encrypted_len = crypto_get_expected_output_length(fsc, req->size);
     __u8 aligned_buffer[req->size] __attribute__((__aligned__(PAGE_SIZE)));
-    __u8 encrypted[encrypted_len]  __attribute__((__aligned__(PAGE_SIZE)));
+    //__u8 encrypted[encrypted_len]  __attribute__((__aligned__(PAGE_SIZE)));
 
     if (req->flags & O_DIRECT) {
         memcpy(aligned_buffer, buffer, req->size);
         buffer = (const __u8*) aligned_buffer;
     }
 
-    if (crypto_encrypt_with_challenges2(fsc, buffer, req->size,
-                                    encrypted, encrypted_len) != S_OK) {
+    fmt = create_xml_formatter();
+    if (!fmt) {
+        ALOGE("[%d] WRITE : ERROR : Could not create XML formatter\n", handler->token);
+        goto error;
+    }
+
+    if (fmt->start_document(fmt) != S_OK) {
+        ALOGE("[%d] WRITE : ERROR : start_document() failed\n", handler->token);
+        goto error;
+    }
+
+    /* TODO fix path */
+    fmt->set_file_name(fmt, "foo");
+    fmt->set_version(fmt, 1);
+    fmt->set_plaintext_length(fmt, req->size);
+
+    if (crypto_encrypt_with_challenges(fsc, fmt,
+                                       buffer, req->size,
+                                       &encrypted, &encrypted_len) != S_OK) {
         ALOGE("[%d] WRITE : ERROR : Encryption failed\n", handler->token);
-        return -EIO;
+        goto error;
     }
 
     TRACE("[%d] WRITE %p(%d) %u@%"PRIu64"\n", handler->token,
                     h, h->fd, req->size, req->offset);
 
-    res = pwrite64(h->fd, encrypted, encrypted_len, 0);
+    if (fmt->set_ciphertext(fmt, encrypted, encrypted_len) != S_OK) {
+        ALOGE("[%d] WRITE : ERROR : Set ciphertext failed\n", handler->token);
+        goto error;
+    }
+    res = fmt->end_document(fmt, h->fd);
+    //res = pwrite64(h->fd, encrypted, encrypted_len, 0);
     if (res < 0)
         return -errno;
 
@@ -1330,8 +1388,16 @@ static int handle_write(struct fuse* fuse, struct fuse_handler* handler,
     ALOGI("[%d] Write --> %u bytes from %llu, FD: %d\n",
             handler->token, req->size, req->offset, h->fd);
 
+    destroy_xml_formatter(fmt);
+    mm_free(encrypted);
+
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
+
+error:
+    destroy_xml_formatter(fmt);
+    mm_free(encrypted);
+    return -EIO;
 }
 
 static int handle_statfs(struct fuse* fuse, struct fuse_handler* handler,
