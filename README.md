@@ -42,7 +42,7 @@ Ejecutamos `repo init` indicándole la ubicación de nuestro manifest.
 
 ```
 ~/android-7-source $ ../repo init \
-        -u https://github.com/DroneFS/cibernoid-manifest.git \
+        -u https://github.com/Cibernoid/cibernoid-manifest.git \
         -b android-7.1.2_r33
 ```
 
